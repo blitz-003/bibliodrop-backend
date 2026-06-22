@@ -4,63 +4,42 @@ const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
 
+const multer = require("multer");
+const cloudinary = require("cloudinary").v2;
+const streamifier = require("streamifier");
 const app = express();
 
 app.use(cors());
 app.use(express.json());
 
-const { Schema, model } = mongoose;
-const bookSchema = new Schema(
-  {
-    title: {
-      type: String,
-      required: true,
-      trim: true,
-    },
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
 
-    author: {
-      type: String,
-      required: true,
-    },
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+});
 
-    description: {
-      type: String,
-      default: "",
-    },
+function uploadToCloudinary(buffer) {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        folder: "biblio_drop/books",
+      },
+      (error, result) => {
+        if (error) return reject(error);
+        resolve(result);
+      },
+    );
 
-    category: {
-      type: String,
-      required: true,
-    },
+    streamifier.createReadStream(buffer).pipe(stream);
+  });
+}
 
-    coverImage: {
-      type: String,
-      default: "",
-    },
-
-    deliveryFee: {
-      type: Number,
-      required: true,
-    },
-
-    availabilityStatus: {
-      type: String,
-      enum: ["available", "checked_out"],
-      default: "available",
-    },
-
-    publishStatus: {
-      type: String,
-      enum: ["pending_approval", "published", "unpublished"],
-      default: "pending_approval",
-    },
-  },
-  {
-    timestamps: true,
-  },
-);
-
-const Book = model("Book", bookSchema);
+const Book = require("./models/book.model");
 
 app.get("/", (req, res) => {
   res.send("BiblioDrop Backend Running");
@@ -103,12 +82,42 @@ app.delete("/books/:id", async (req, res) => {
   }
 });
 
-app.post("/books", async (req, res) => {
+// app.post("/books", upload.any(), (req, res) => {
+//   console.log(req.files);
+//   res.send("OK");
+// });
+app.post("/books", upload.single("image"), async (req, res) => {
   try {
-    const book = await Book.create(req.body);
-    res.status(201).json(book);
+    // 1. get file from request
+    const file = req.file;
+
+    if (!file) {
+      return res.status(400).json({
+        message: "Image is required",
+      });
+    }
+
+    // 2. upload to cloudinary
+    const uploadResult = await uploadToCloudinary(file.buffer);
+
+    // 3. build book object
+    const book = {
+      title: req.body.title,
+      author: req.body.author,
+      description: req.body.description,
+      category: req.body.category,
+      deliveryFee: Number(req.body.deliveryFee),
+      coverImage: uploadResult.secure_url,
+    };
+
+    // 4. save to MongoDB
+    const savedBook = await Book.create(book);
+
+    res.status(201).json(savedBook);
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    res.status(500).json({
+      error: err.message,
+    });
   }
 });
 
