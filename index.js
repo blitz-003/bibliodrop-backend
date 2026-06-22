@@ -47,7 +47,27 @@ app.get("/", (req, res) => {
 
 app.get("/books", async (req, res) => {
   try {
-    const books = await Book.find();
+    const { search, category, available } = req.query;
+
+    let query = {};
+
+    //  Search by title (case-insensitive)
+    if (search) {
+      query.title = { $regex: search, $options: "i" };
+    }
+
+    // Category filter
+    if (category) {
+      query.category = category;
+    }
+
+    // Availability filter (convert string → boolean)
+    if (available !== undefined) {
+      query.available = available === "true";
+    }
+
+    const books = await Book.find(query);
+
     res.json(books);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -55,6 +75,7 @@ app.get("/books", async (req, res) => {
 });
 
 app.get("/books/:id", async (req, res) => {
+  console.log(req.params.id);
   try {
     const book = await Book.findById(req.params.id);
 
@@ -82,35 +103,47 @@ app.delete("/books/:id", async (req, res) => {
   }
 });
 
-// app.post("/books", upload.any(), (req, res) => {
-//   console.log(req.files);
-//   res.send("OK");
-// });
-app.post("/books", upload.single("image"), async (req, res) => {
+app.post("/books", upload.single("coverImage"), async (req, res) => {
   try {
-    // 1. get file from request
+    // 1. file check
     const file = req.file;
 
     if (!file) {
       return res.status(400).json({
-        message: "Image is required",
+        message: "Cover image is required",
       });
     }
 
     // 2. upload to cloudinary
     const uploadResult = await uploadToCloudinary(file.buffer);
 
-    // 3. build book object
+    // 3. build book object safely
     const book = {
       title: req.body.title,
       author: req.body.author,
       description: req.body.description,
       category: req.body.category,
-      deliveryFee: Number(req.body.deliveryFee),
+
       coverImage: uploadResult.secure_url,
+
+      // optional numeric field
+      deliveryFee: req.body.deliveryFee ? Number(req.body.deliveryFee) : 0,
+
+      // ✅ default system fields
+      availabilityStatus: req.body.availabilityStatus || "available",
+      publishStatus: req.body.publishStatus || "published",
+
+      // ⚠️ ideally from auth middleware (not req.body)
+      ownerId: req.body.ownerId || null,
+      ownerName: req.body.ownerName || null,
+      ownerEmail: req.body.ownerEmail || null,
+
+      // default rating system
+      totalReviews: 0,
+      averageRating: 0,
     };
 
-    // 4. save to MongoDB
+    // 4. save
     const savedBook = await Book.create(book);
 
     res.status(201).json(savedBook);
