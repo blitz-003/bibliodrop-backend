@@ -118,9 +118,6 @@ app.delete("/books/:id", async (req, res) => {
   }
 });
 
-console.log("requireAuth:", typeof requireAuth);
-console.log("requireRole:", typeof requireRole);
-console.log("upload.single:", typeof upload.single);
 app.post(
   "/books",
   requireAuth,
@@ -180,6 +177,46 @@ app.post(
     } catch (err) {
       res.status(500).json({
         error: err.message,
+      });
+    }
+  },
+);
+
+app.get(
+  "/dashboard/inventory",
+  requireAuth,
+  requireRole("librarian"),
+  async (req, res) => {
+    try {
+      const user = req.user;
+
+      // 📦 get only books created by this librarian
+      const books = await Book.find({
+        createdBy: user._id,
+      }).sort({ createdAt: -1 });
+
+      // 🧠 optional: compute stock fields safely
+      const formatted = books.map((b) => ({
+        _id: b._id,
+        title: b.title,
+        category: b.category,
+        coverImage: b.coverImage,
+
+        deliveryFee: b.deliveryFee,
+
+        availabilityStatus: b.availabilityStatus,
+
+        // if you don’t have stock system yet, fallback safely
+        totalCopies: b.totalCopies || 0,
+        stock: b.stock || 0,
+
+        createdAt: b.createdAt,
+      }));
+
+      return res.status(200).json(formatted);
+    } catch (err) {
+      return res.status(500).json({
+        message: err.message,
       });
     }
   },
