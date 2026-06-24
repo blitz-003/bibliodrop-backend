@@ -7,6 +7,9 @@ const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
 
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+const Transaction = require("./models/Transaction");
+
 const multer = require("multer");
 const cloudinary = require("cloudinary").v2;
 const streamifier = require("streamifier");
@@ -18,9 +21,100 @@ app.use(
     credentials: true,
   }),
 );
+
+// B. STRIPE WEBHOOK ENDPOINT (Must sit BEFORE express.json())
+app.post(
+  "/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const sig = req.headers["stripe-signature"];
+    let event;
+
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
+        process.env.STRIPE_WEBHOOK_SECRET,
+      );
+    } catch (err) {
+      console.error(`Webhook Signature Verification Failed: ${err.message}`);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    // Handle successful checkouts
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object;
+      const { bookId, userId } = session.metadata;
+
+      try {
+        // 1. Log payment into the transactions log
+        await Transaction.create({
+          stripeSessionId: session.id,
+          bookId,
+          userId,
+          amountPaid: session.amount_total / 100, // Converts cents back to dollars
+          currency: session.currency,
+          status: "completed",
+        });
+
+        // 2. Decrement available inventory stock counters
+        await Book.findByIdAndUpdate(bookId, {
+          $inc: { availableStock: -1 },
+        });
+
+        console.log(
+          `Payment confirmed and stock updated for book ID: ${bookId}`,
+        );
+      } catch (dbErr) {
+        console.error("Database update error during webhook process:", dbErr);
+        return res.status(500).send("Internal Database Update Error");
+      }
+    }
+
+    res.status(200).json({ received: true });
+  },
+);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+app.post("/create-checkout-session", requireAuth, async (req, res) => {
+  try {
+    const { bookId, title, deliveryFee, coverImage } = req.body;
+    const userId = req.user.id; // Pulled from your authentication middleware validation
+
+    // Stripe expects values in the smallest currency denomination (cents)
+    const amountInCents = Math.round(Number(deliveryFee) * 100);
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ["card"],
+      line_items: [
+        {
+          price_data: {
+            currency: "usd",
+            product_data: {
+              name: `Delivery Fee: ${title}`,
+              images: [coverImage],
+            },
+            unit_amount: amountInCents,
+          },
+          quantity: 1,
+        },
+      ],
+      mode: "payment",
+      metadata: {
+        bookId,
+        userId,
+      },
+      success_url: `http://localhost:3000/dashboard/payment/success`,
+      cancel_url: `http://localhost:3000/dashboard/payment/cancel`,
+    });
+
+    res.status(200).json({ url: session.url });
+  } catch (err) {
+    console.error("Checkout generation crashed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
