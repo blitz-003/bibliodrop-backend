@@ -507,6 +507,51 @@ app.get(
   },
 );
 
+// ADMIN: Fetch all transactions with compiled Book, User, Librarian, and Delivery Status details
+app.get(
+  "/admin/transactions",
+  requireAuth,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      // 1. Fetch all transactions and populate the book details (ownerId, ownerName are stored inside Book)
+      const transactions = await Transaction.find()
+        .populate("bookId") // Populates the book schema fields
+        .sort({ createdAt: -1 });
+
+      // 2. Map through transactions and attach their corresponding delivery status
+      const compiledTransactions = await Promise.all(
+        transactions.map(async (tx) => {
+          // Find the delivery document associated with this transaction
+          const delivery = await Delivery.findOne({ transactionId: tx._id });
+
+          return {
+            _id: tx._id,
+            stripeSessionId: tx.stripeSessionId,
+            amountPaid: tx.amountPaid,
+            createdAt: tx.createdAt,
+            userId: tx.userId,
+            // Safely extract populated book data fallbacks
+            bookName: tx.bookId ? tx.bookId.title : "Deleted Book",
+            librarianName: tx.bookId
+              ? tx.bookId.ownerName || "Staff"
+              : "Unknown Librarian",
+            // Pull delivery status from the Delivery model, fallback to transaction state if missing
+            deliveryStatus: delivery ? delivery.status : "pending",
+          };
+        }),
+      );
+
+      res.json(compiledTransactions);
+    } catch (err) {
+      console.error("Error generating admin transaction logs:", err);
+      res
+        .status(500)
+        .json({ error: "Failed to compile transaction ledger streams." });
+    }
+  },
+);
+
 async function main() {
   try {
     await mongoose.connect(process.env.DB_URL);
