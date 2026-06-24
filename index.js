@@ -1,13 +1,7 @@
-console.log("require type:", typeof require);
-console.log("module type:", typeof module);
-
 require("dotenv").config();
 
 const requireAuth = require("./middleware/requireAuth.js");
 const requireRole = require("./middleware/requireRole.js");
-
-console.log(typeof requireAuth);
-console.log(typeof requireRole);
 
 const express = require("express");
 const mongoose = require("mongoose");
@@ -81,6 +75,8 @@ app.get("/books", async (req, res) => {
       query.available = available === "true";
     }
 
+    query.publishStatus = "approved";
+
     const books = await Book.find(query);
 
     res.json(books);
@@ -93,6 +89,7 @@ app.get("/books/:id", async (req, res) => {
   console.log(req.params.id);
   try {
     const book = await Book.findById(req.params.id);
+    console.log(book);
 
     if (!book) {
       return res.status(404).json({ message: "Book not found" });
@@ -117,6 +114,74 @@ app.delete("/books/:id", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+app.get(
+  "/adminApproval",
+  requireAuth,
+  requireRole("admin"), // Ensures only admins can see this list
+  async (req, res) => {
+    try {
+      console.log("backend here");
+      // Find all books where publishStatus matches "pending"
+      const pendingBooks = await Book.find({ publishStatus: "pending" }).sort({
+        createdAt: 1,
+      }); // Oldest pending items first
+
+      // Return the array of books
+      res.status(200).json(pendingBooks);
+    } catch (err) {
+      console.error("Error fetching approval books:", err);
+      res.status(500).json({
+        error: "Failed to fetch pending books",
+        details: err.message,
+      });
+    }
+  },
+);
+
+app.patch(
+  "/books/:bookId/status", // Matches your frontend URL parameter exactly
+  requireAuth,
+  requireRole("admin"), // Protects this route so only admins can execute approvals
+  async (req, res) => {
+    try {
+      const { bookId } = req.params;
+      const { publishStatus } = req.body;
+
+      // 1. Validation Check
+      if (!["approved", "rejected"].includes(publishStatus)) {
+        return res.status(400).json({
+          message: "Invalid status value. Must be 'approved' or 'rejected'.",
+        });
+      }
+
+      // 2. Database Update
+      // Swapping findByIdAndUpdate's target property to match 'publishStatus'
+      const updatedBook = await Book.findByIdAndUpdate(
+        bookId,
+        {
+          publishStatus: publishStatus,
+          updatedAt: new Date(),
+        },
+        { new: true }, // Returns the newly updated book document
+      );
+
+      // 3. Fallback check if ID is invalid or missing
+      if (!updatedBook) {
+        return res.status(404).json({ message: "Target book not found" });
+      }
+
+      // 4. Return the updated document back to your frontend TanStack mutation
+      res.status(200).json(updatedBook);
+    } catch (err) {
+      console.error("Error updating book publication status:", err);
+      res.status(500).json({
+        error: "Internal server error while updating status",
+        details: err.message,
+      });
+    }
+  },
+);
 
 app.post(
   "/books",
@@ -144,8 +209,7 @@ app.post(
         return res.status(401).json({ message: "Unauthorized" });
       }
 
-      // 4. build book object safely
-      const book = {
+      const bookData = {
         title: req.body.title,
         author: req.body.author,
         description: req.body.description,
@@ -153,25 +217,28 @@ app.post(
 
         coverImage: uploadResult.secure_url,
 
-        // optional numeric field
-        deliveryFee: req.body.deliveryFee ? Number(req.body.deliveryFee) : 0,
+        deliveryFee: Number(req.body.deliveryFee),
 
-        // default system fields
-        availabilityStatus: req.body.availabilityStatus || "available",
-        publishStatus: req.body.publishStatus || "published",
+        totalStock: Number(req.body.stock),
+        availableStock: Number(req.body.stock),
 
-        // ✅ FIXED: from authenticated user (NOT req.body)
+        publishStatus: "pending",
+        deliveryStatus: "available",
+
         ownerId: user.id,
         ownerName: user.name,
         ownerEmail: user.email,
 
-        // default rating system
         totalReviews: 0,
         averageRating: 0,
+
+        createdAt: new Date(),
+        updatedAt: new Date(),
       };
 
-      // 5. save
-      const savedBook = await Book.create(book);
+      console.log("okay upto here");
+
+      const savedBook = await Book.create(bookData);
 
       res.status(201).json(savedBook);
     } catch (err) {
@@ -190,30 +257,30 @@ app.get(
     try {
       const user = req.user;
 
-      // 📦 get only books created by this librarian
+      // get only books created by this librarian
       const books = await Book.find({
         createdBy: user._id,
       }).sort({ createdAt: -1 });
 
-      // 🧠 optional: compute stock fields safely
-      const formatted = books.map((b) => ({
-        _id: b._id,
-        title: b.title,
-        category: b.category,
-        coverImage: b.coverImage,
+      //  optional: compute stock fields safely
+      // const formatted = books.map((b) => ({
+      //   _id: b._id,
+      //   title: b.title,
+      //   category: b.category,
+      //   coverImage: b.coverImage,
 
-        deliveryFee: b.deliveryFee,
+      //   deliveryFee: b.deliveryFee,
 
-        availabilityStatus: b.availabilityStatus,
+      //   availabilityStatus: b.availabilityStatus,
 
-        // if you don’t have stock system yet, fallback safely
-        totalCopies: b.totalCopies || 0,
-        stock: b.stock || 0,
+      //   // if you don’t have stock system yet, fallback safely
+      //   totalCopies: b.totalCopies || 0,
+      //   stock: b.stock || 0,
 
-        createdAt: b.createdAt,
-      }));
+      //   createdAt: b.createdAt,
+      // }));
 
-      return res.status(200).json(formatted);
+      return res.status(200).json(books);
     } catch (err) {
       return res.status(500).json({
         message: err.message,
