@@ -106,14 +106,26 @@ app.get("/deliveries/history", requireAuth, async (req, res) => {
   }
 });
 
-// B. LIBRARIAN: Fetch all deliveries across system queue lines
+// B. LIBRARIAN: Fetch ONLY deliveries related to books owned by this librarian
 app.get(
   "/deliveries/manage",
   requireAuth,
   requireRole("librarian"),
   async (req, res) => {
     try {
-      const queue = await Delivery.find().sort({ createdAt: -1 });
+      const librarianId = req.user.id;
+
+      // 1. Find all books created/owned by this librarian
+      const myBooks = await Book.find({ ownerId: librarianId }).select("_id");
+
+      // Extract just the array of IDs: [ObjectId('...'), ObjectId('...')]
+      const myBookIds = myBooks.map((book) => book._id);
+
+      // 2. Only find deliveries matching those book IDs
+      const queue = await Delivery.find({
+        bookId: { $in: myBookIds },
+      }).sort({ createdAt: -1 });
+
       res.json(queue);
     } catch (err) {
       res.status(500).json({ error: err.message });
@@ -121,7 +133,7 @@ app.get(
   },
 );
 
-// C. LIBRARIAN: Update Fulfillment State Machine (Pending -> Dispatched -> Delivered)
+// C. LIBRARIAN: Update Fulfillment State Machine (With strict ownership check)
 app.patch(
   "/deliveries/:id/status",
   requireAuth,
@@ -129,17 +141,33 @@ app.patch(
   async (req, res) => {
     try {
       const { status } = req.body;
+      const librarianId = req.user.id;
+
       if (!["dispatched", "delivered"].includes(status)) {
         return res
           .status(400)
           .json({ message: "Invalid workflow state sequence." });
       }
 
-      const updatedDelivery = await Delivery.findByIdAndUpdate(
-        req.params.id,
-        { status, updatedAt: new Date() },
-        { new: true },
-      );
+      // 1. Find the target delivery first
+      const deliveryItem = await Delivery.findById(req.params.id);
+      if (!deliveryItem) {
+        return res.status(404).json({ message: "Delivery record not found." });
+      }
+
+      // 2. Look up the book to check who owns it
+      const parentBook = await Book.findById(deliveryItem.bookId);
+      if (!parentBook || parentBook.ownerId !== librarianId) {
+        return res.status(403).json({
+          message:
+            "Access Denied: You do not own the book associated with this delivery pipeline.",
+        });
+      }
+
+      // 3. Proceed with update since authorization passed
+      deliveryItem.status = status;
+      deliveryItem.updatedAt = new Date();
+      const updatedDelivery = await deliveryItem.save();
 
       res.json(updatedDelivery);
     } catch (err) {
@@ -147,7 +175,6 @@ app.patch(
     }
   },
 );
-
 // A. USER: Get delivery history logs
 app.get("/deliveries/history", requireAuth, async (req, res) => {
   try {
@@ -475,28 +502,10 @@ app.get(
     try {
       const user = req.user;
 
-      // get only books created by this librarian
+      // FIX: Query using ownerId and user.id to match your schema setup
       const books = await Book.find({
-        createdBy: user._id,
+        ownerId: user.id,
       }).sort({ createdAt: -1 });
-
-      //  optional: compute stock fields safely
-      // const formatted = books.map((b) => ({
-      //   _id: b._id,
-      //   title: b.title,
-      //   category: b.category,
-      //   coverImage: b.coverImage,
-
-      //   deliveryFee: b.deliveryFee,
-
-      //   availabilityStatus: b.availabilityStatus,
-
-      //   // if you don’t have stock system yet, fallback safely
-      //   totalCopies: b.totalCopies || 0,
-      //   stock: b.stock || 0,
-
-      //   createdAt: b.createdAt,
-      // }));
 
       return res.status(200).json(books);
     } catch (err) {
