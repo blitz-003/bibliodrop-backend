@@ -48,22 +48,37 @@ app.post(
 
       try {
         // 1. Log payment into the transactions log
-        await Transaction.create({
+        const newTransaction = await Transaction.create({
           stripeSessionId: session.id,
           bookId,
           userId,
-          amountPaid: session.amount_total / 100, // Converts cents back to dollars
+          amountPaid: session.amount_total / 100,
           currency: session.currency,
           status: "completed",
         });
 
-        // 2. Decrement available inventory stock counters
+        // Fetch the book title and user details from DB or session context
+        const bookDetails = await Book.findById(bookId);
+
+        // 2. Create the Delivery document automatically starting as "pending"
+        await Delivery.create({
+          transactionId: newTransaction._id,
+          stripeSessionId: session.id,
+          bookId,
+          bookTitle: bookDetails ? bookDetails.title : "Unknown Book",
+          userId: userId,
+          userName: session.customer_details?.name || "Client", // Extracted from Stripe billing checkout
+          deliveryFee: session.amount_total / 100,
+          status: "pending",
+        });
+
+        // 3. Decrement stock
         await Book.findByIdAndUpdate(bookId, {
           $inc: { availableStock: -1 },
         });
 
         console.log(
-          `Payment confirmed and stock updated for book ID: ${bookId}`,
+          `Fulfillment and delivery document instantiated for Book: ${bookId}`,
         );
       } catch (dbErr) {
         console.error("Database update error during webhook process:", dbErr);
@@ -77,6 +92,115 @@ app.post(
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+const Delivery = require("./models/Delivery");
+
+// A. USER: Get delivery history logs
+app.get("/deliveries/history", requireAuth, async (req, res) => {
+  try {
+    const userDeliveries = await Delivery.find({ userId: req.user.id }).sort({
+      createdAt: -1,
+    });
+    res.json(userDeliveries);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// B. LIBRARIAN: Fetch all deliveries across system queue lines
+app.get(
+  "/deliveries/manage",
+  requireAuth,
+  requireRole("librarian"),
+  async (req, res) => {
+    try {
+      const queue = await Delivery.find().sort({ createdAt: -1 });
+      res.json(queue);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+// C. LIBRARIAN: Update Fulfillment State Machine (Pending -> Dispatched -> Delivered)
+app.patch(
+  "/deliveries/:id/status",
+  requireAuth,
+  requireRole("librarian"),
+  async (req, res) => {
+    try {
+      const { status } = req.body;
+      if (!["dispatched", "delivered"].includes(status)) {
+        return res
+          .status(400)
+          .json({ message: "Invalid workflow state sequence." });
+      }
+
+      const updatedDelivery = await Delivery.findByIdAndUpdate(
+        req.params.id,
+        { status, updatedAt: new Date() },
+        { new: true },
+      );
+
+      res.json(updatedDelivery);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+// A. USER: Get delivery history logs
+app.get("/deliveries/history", requireAuth, async (req, res) => {
+  try {
+    const userDeliveries = await Delivery.find({ userId: req.user.id }).sort({
+      createdAt: -1,
+    });
+    res.json(userDeliveries);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// B. LIBRARIAN: Fetch all deliveries across system queue lines
+app.get(
+  "/deliveries/manage",
+  requireAuth,
+  requireRole("librarian"),
+  async (req, res) => {
+    try {
+      const queue = await Delivery.find().sort({ createdAt: -1 });
+      res.json(queue);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+// C. LIBRARIAN: Update Fulfillment State Machine (Pending -> Dispatched -> Delivered)
+app.patch(
+  "/deliveries/:id/status",
+  requireAuth,
+  requireRole("librarian"),
+  async (req, res) => {
+    try {
+      const { status } = req.body;
+      if (!["dispatched", "delivered"].includes(status)) {
+        return res
+          .status(400)
+          .json({ message: "Invalid workflow state sequence." });
+      }
+
+      const updatedDelivery = await Delivery.findByIdAndUpdate(
+        req.params.id,
+        { status, updatedAt: new Date() },
+        { new: true },
+      );
+
+      res.json(updatedDelivery);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  },
+);
 app.post("/create-checkout-session", requireAuth, async (req, res) => {
   try {
     const { bookId, title, deliveryFee, coverImage } = req.body;
