@@ -17,7 +17,7 @@ const app = express();
 
 app.use(
   cors({
-    origin: "http://localhost:3000",
+    origin: process.env.FRONTEND_URL,
     credentials: true,
   }),
 );
@@ -268,8 +268,8 @@ app.post("/create-checkout-session", requireAuth, async (req, res) => {
         bookId,
         userId,
       },
-      success_url: `http://localhost:3000/dashboard/payment/success`,
-      cancel_url: `http://localhost:3000/dashboard/payment/cancel`,
+      success_url: `${process.env.FRONTEND_URL}/dashboard/payment/success`,
+      cancel_url: `${process.env.FRONTEND_URL}/dashboard/payment/cancel`,
     });
 
     res.status(200).json({ url: session.url });
