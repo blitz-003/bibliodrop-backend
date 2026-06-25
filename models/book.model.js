@@ -103,6 +103,15 @@ const bookSchema = new Schema(
       default: 0,
       min: 0,
     },
+    reviews: [
+      {
+        userId: String,
+        userName: String,
+        comment: String,
+        rating: Number,
+        createdAt: { type: Date, default: Date.now },
+      },
+    ],
   },
   {
     // This automatically creates and updates 'createdAt' and 'updatedAt' fields

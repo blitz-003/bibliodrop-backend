@@ -228,13 +228,21 @@ app.patch(
     }
   },
 );
+
 app.post("/create-checkout-session", requireAuth, async (req, res) => {
   try {
     const { bookId, title, deliveryFee, coverImage } = req.body;
-    const userId = req.user.id; // Pulled from your authentication middleware validation
+    const userId = req.user.id;
 
-    // Stripe expects values in the smallest currency denomination (cents)
-    const amountInCents = Math.round(Number(deliveryFee) * 100);
+    // 1. Force convert string/float inputs into a clean, rounded integer cent value
+    const amountInCents = Math.round(parseFloat(deliveryFee) * 100);
+
+    // 2. Safety Check: If it somehow still fails to parse, default to a minimum or throw an error
+    if (isNaN(amountInCents) || amountInCents <= 0) {
+      return res
+        .status(400)
+        .json({ error: "Invalid delivery fee amount value." });
+    }
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
@@ -244,9 +252,13 @@ app.post("/create-checkout-session", requireAuth, async (req, res) => {
             currency: "usd",
             product_data: {
               name: `Delivery Fee: ${title}`,
-              images: [coverImage],
+              // Ensure we pass an absolute fallback image string if coverImage is null
+              images: [
+                coverImage ||
+                  "https://images.unsplash.com/photo-1543002588-bfa74002ed7e?q=80&w=400",
+              ],
             },
-            unit_amount: amountInCents,
+            unit_amount: amountInCents, // This MUST be a clean integer
           },
           quantity: 1,
         },
@@ -330,21 +342,114 @@ app.get("/books", async (req, res) => {
   }
 });
 
-app.get("/books/:id", async (req, res) => {
-  console.log(req.params.id);
+// GET: Fetch Book Details Wrapper Payload
+app.get("/books/:id", requireAuth, async (req, res) => {
   try {
-    const book = await Book.findById(req.params.id);
-    console.log(book);
+    const bookId = req.params.id;
+    const userId = req.user.id; // Extracted from auth middleware token
 
+    // 1. Fetch the book profile document
+    const book = await Book.findById(bookId);
     if (!book) {
-      return res.status(404).json({ message: "Book not found" });
+      return res.status(404).json({ message: "Catalog item context missing." });
     }
 
-    res.json(book);
+    // 2. Check if a payment transaction has been processed
+    const transaction = await Transaction.findOne({
+      bookId: bookId,
+      userId: userId,
+      status: "completed",
+    });
+
+    // 3. Query the deliveries collection using the book and user pairing
+    // (Replace 'Delivery' with your exact imported Mongoose model name)
+    const deliveryRecord = await Delivery.findOne({
+      bookId: bookId,
+      userId: userId,
+    });
+
+    // 4. Return wrapper along with dynamic UI permissions flags
+    res.status(200).json({
+      book,
+      isLibrarianOwner: String(book.ownerId) === String(userId),
+
+      // Locks payment button if a completed transaction document is logged
+      hasRequestedDelivery: !!transaction,
+
+      // Unlocks reviews ONLY if delivery document exists and its status key matches "delivered"
+      // (Change "delivered" if your delivery model uses a different keyword like "Completed" or "Shipped")
+      canReview: deliveryRecord && deliveryRecord.status === "delivered",
+    });
+  } catch (err) {
+    console.error("Error evaluating book detail flags:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+app.post("/books/:id/reviews", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+
+    // Verify package is arrived via deliveries collection
+    const deliveryRecord = await Delivery.findOne({ bookId: id, userId });
+
+    if (!deliveryRecord || deliveryRecord.status !== "delivered") {
+      return res.status(403).json({
+        message:
+          "Action Blocked: Reviews are unlocked only after your package status shows delivered.",
+      });
+    }
+
+    // Continue with your existing code logic to push the review parameters...
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
+
+// DELETE: REMOVE USER ACCOUNT
+app.delete(
+  "/admin/users/:id",
+  requireAuth,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      const targetUserId = req.params.id;
+
+      if (targetUserId === req.user.id) {
+        return res.status(400).json({
+          message:
+            "Self-destruction blocked. You cannot delete your own admin account.",
+        });
+      }
+
+      // 1. Find the user first to check their role before deleting them
+      const userToDelete = await User.findById(targetUserId);
+      if (!userToDelete) {
+        return res.status(404).json({ message: "User not found." });
+      }
+
+      // 2. If they are a librarian, hide their books from the store instantly
+      if (userToDelete.role === "librarian") {
+        await Book.updateMany(
+          { ownerId: targetUserId },
+          { publishStatus: "rejected" }, // Instantly removes them from storefront matching
+        );
+      }
+
+      // 3. Delete the actual user account
+      await User.findByIdAndDelete(targetUserId);
+
+      res.json({
+        message:
+          "Account deleted and associated store items deactivated successfully.",
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  },
+);
 
 app.delete("/books/:id", async (req, res) => {
   try {
@@ -517,21 +622,19 @@ app.get(
 );
 
 // ADMIN: Fetch all transactions with compiled Book, User, Librarian, and Delivery Status details
+// ADMIN: Fetch all transactions
 app.get(
   "/admin/transactions",
   requireAuth,
   requireRole("admin"),
   async (req, res) => {
     try {
-      // 1. Fetch all transactions and populate the book details (ownerId, ownerName are stored inside Book)
       const transactions = await Transaction.find()
-        .populate("bookId") // Populates the book schema fields
+        .populate("bookId")
         .sort({ createdAt: -1 });
 
-      // 2. Map through transactions and attach their corresponding delivery status
       const compiledTransactions = await Promise.all(
         transactions.map(async (tx) => {
-          // Find the delivery document associated with this transaction
           const delivery = await Delivery.findOne({ transactionId: tx._id });
 
           return {
@@ -539,13 +642,13 @@ app.get(
             stripeSessionId: tx.stripeSessionId,
             amountPaid: tx.amountPaid,
             createdAt: tx.createdAt,
-            userId: tx.userId,
-            // Safely extract populated book data fallbacks
+            userId: tx.userId || "Deleted Account",
+            // SAFELY HANDLE NULL CHECKS HERE:
             bookName: tx.bookId ? tx.bookId.title : "Deleted Book",
-            librarianName: tx.bookId
-              ? tx.bookId.ownerName || "Staff"
-              : "Unknown Librarian",
-            // Pull delivery status from the Delivery model, fallback to transaction state if missing
+            librarianName:
+              tx.bookId && tx.bookId.ownerName
+                ? tx.bookId.ownerName
+                : "Staff (Account Deleted)",
             deliveryStatus: delivery ? delivery.status : "pending",
           };
         }),
@@ -553,13 +656,266 @@ app.get(
 
       res.json(compiledTransactions);
     } catch (err) {
-      console.error("Error generating admin transaction logs:", err);
       res
         .status(500)
         .json({ error: "Failed to compile transaction ledger streams." });
     }
   },
 );
+
+const User =
+  mongoose.models.User ||
+  mongoose.model("User", new mongoose.Schema({}, { strict: false }), "user");
+
+// 2. Add the GET users endpoint
+app.get("/admin/users", requireAuth, requireRole("admin"), async (req, res) => {
+  try {
+    // Fetch all accounts from the collection, newest first
+    const users = await User.find().sort({ createdAt: -1 });
+
+    // Send them back to your Next.js client page
+    res.status(200).json(users);
+  } catch (err) {
+    console.error("Failed to retrieve user accounts:", err);
+    res
+      .status(500)
+      .json({ error: "Internal Database Error reading users collection" });
+  }
+});
+
+// PATCH: UPDATE USER ROLE (Admin Only)
+app.patch(
+  "/admin/users/:id/role",
+  requireAuth,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      const { role } = req.body;
+      const targetUserId = req.params.id;
+
+      // 1. Validation Guard: Check if the role is allowed
+      if (!["user", "librarian", "admin"].includes(role)) {
+        return res
+          .status(400)
+          .json({ message: "Invalid role assignment target." });
+      }
+
+      // 2. Prevent an Admin from accidentally demoting themselves
+      if (targetUserId === req.user.id) {
+        return res.status(400).json({
+          message: "Access Denied: You cannot change your own admin role.",
+        });
+      }
+
+      // 3. Find user and update their role inside the singular "user" collection
+      const updatedUser = await User.findByIdAndUpdate(
+        targetUserId,
+        { role },
+        { new: true }, // Returns the newly modified user document
+      );
+
+      if (!updatedUser) {
+        return res.status(404).json({ message: "User account not found." });
+      }
+
+      // Send back the updated user so the frontend toast notification can read it
+      res.status(200).json(updatedUser);
+    } catch (err) {
+      console.error("Failed to alter user role:", err);
+      res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+app.get("/debug-db", async (req, res) => {
+  try {
+    // 1. Get a list of all actual collections in your MongoDB database
+    const collections = await mongoose.connection.db
+      .listCollections()
+      .toArray();
+    const names = collections.map((c) => c.name);
+
+    // 2. Try a raw database find bypass
+    const rawUsers = await mongoose.connection.db
+      .collection("users")
+      .find({})
+      .toArray()
+      .catch(() => []);
+    const rawUserSingular = await mongoose.connection.db
+      .collection("user")
+      .find({})
+      .toArray()
+      .catch(() => []);
+
+    res.json({
+      activeCollectionsInYourDB: names,
+      documentsFoundInPluralUsers: rawUsers.length,
+      documentsFoundInSingularUser: rawUserSingular.length,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH: ADMIN TOGGLE BOOK PUBLISH STATUS (Admin Only)
+app.patch(
+  "/admin/books/:id/status",
+  requireAuth,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      const { publishStatus } = req.body;
+      const { id } = req.params;
+
+      // 1. Validation Check (matching your schema's existing states)
+      if (!["approved", "rejected"].includes(publishStatus)) {
+        return res.status(400).json({
+          message:
+            "Invalid status value. Use 'approved' to publish or 'rejected' to unpublish.",
+        });
+      }
+
+      // 2. Database Update
+      const updatedBook = await Book.findByIdAndUpdate(
+        id,
+        { publishStatus, updatedAt: new Date() },
+        { new: true }, // Returns the newly modified book document
+      );
+
+      if (!updatedBook) {
+        return res
+          .status(404)
+          .json({ message: "Target book document not found." });
+      }
+
+      res.status(200).json(updatedBook);
+    } catch (err) {
+      console.error("Error toggling book publication state:", err);
+      res.status(500).json({
+        error: "Internal server error while updating publication settings.",
+      });
+    }
+  },
+);
+
+// GET: ALL SYSTEM BOOKS FOR ADMIN
+app.get("/admin/books", requireAuth, requireRole("admin"), async (req, res) => {
+  try {
+    const books = await Book.find().sort({ createdAt: -1 });
+    res.status(200).json(books);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET: Fetch user's personal delivered reading list (Client Only)
+app.get("/dashboard/reading-list", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // 1. Fetch only completed deliveries belonging to this user
+    const completedDeliveries = await Delivery.find({
+      userId: userId,
+      status: "delivered",
+    })
+      .populate("bookId") // Populates the related Book document
+      .sort({ updatedAt: -1 }); // Newest delivered items first
+
+    // 2. Extract and format the book details cleanly
+    const readingList = completedDeliveries
+      .filter((delivery) => delivery.bookId) // Guard against any deleted books
+      .map((delivery) => {
+        const book = delivery.bookId;
+        return {
+          deliveryId: delivery._id,
+          deliveredAt: delivery.updatedAt,
+          _id: book._id,
+          title: book.title,
+          author: book.author,
+          category: book.category || "General",
+          description: book.description || "No description provided.",
+          coverImage:
+            book.coverImage ||
+            "https://images.unsplash.com/photo-1543002588-bfa74002ed7e?q=80&w=400",
+        };
+      });
+
+    res.status(200).json(readingList);
+  } catch (err) {
+    console.error("Error generating reading list streams:", err);
+    res
+      .status(500)
+      .json({ error: "Internal server error fetching reading list." });
+  }
+});
+
+// PATCH: Toggle Publication Visibility (Librarian Owner Domain)
+app.patch("/books/:id/toggle-publish", requireAuth, async (req, res) => {
+  try {
+    const bookId = req.params.id;
+    const user = req.user; // Populated by your requireAuth middleware
+
+    // 1. Fetch the book to verify ownership
+    const book = await Book.findById(bookId);
+    if (!book)
+      return res.status(404).json({ message: "Book volume not found." });
+
+    // 2. Authorization Guard: Ensure this librarian actually owns this asset
+    if (String(book.ownerId) !== String(user.id)) {
+      return res.status(403).json({
+        message: "Permission Denied: You do not own this catalog item.",
+      });
+    }
+
+    // 3. Toggle the status dynamically based on what your schema uses:
+    // If using 'publishStatus' string ("approved" vs "rejected")
+    book.publishStatus =
+      book.publishStatus === "approved" ? "rejected" : "approved";
+
+    // OR if your schema uses a boolean 'isPublished', uncomment this instead:
+    // book.isPublished = !book.isPublished;
+
+    await book.save();
+    res.status(200).json(book);
+  } catch (err) {
+    console.error("Librarian Toggle Publish Error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT: Update Existing Catalog Item Properties (Strict Librarian Validation Guard)
+app.put("/books/:id", requireAuth, async (req, res) => {
+  try {
+    const bookId = req.params.id;
+    const user = req.user; // Extract identity context via token injection check
+
+    const book = await Book.findById(bookId);
+    if (!book)
+      return res.status(404).json({ message: "Book entity context missing." });
+
+    // Authorization Barrier Check: Verify document execution level authority
+    if (String(book.ownerId) !== String(user.id)) {
+      return res.status(403).json({
+        message: "Forbidden: You are not authorized to edit this book.",
+      });
+    }
+
+    // Apply the clean payload mappings safely
+    const { title, author, description, category, deliveryFee } = req.body;
+
+    book.title = title ?? book.title;
+    book.author = author ?? book.author;
+    book.description = description ?? book.description;
+    book.category = category ?? book.category;
+    book.deliveryFee = deliveryFee ?? book.deliveryFee;
+
+    await book.save();
+    res.status(200).json(book);
+  } catch (err) {
+    console.error("Backend PUT Error mapping details compilation:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 async function main() {
   try {
