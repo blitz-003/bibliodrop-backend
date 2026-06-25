@@ -1348,6 +1348,55 @@ app.get("/dashboard/admin", requireAuth, async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+
+app.get("/books", async (req, res) => {
+  try {
+    const { search, category, available } = req.query;
+
+    // 1. DYNAMIC SEARCH & FILTER MONGOOSE QUERY OBJECT
+    let query = {};
+
+    if (search) {
+      query.title = { $regex: search, $options: "i" }; // Case-insensitive title lookup
+    }
+
+    if (category) {
+      query.category = category;
+    }
+
+    if (available !== undefined) {
+      query.available = available === "true";
+    }
+
+    // 2. PARSE CONFIGURABLE PAGINATION LIMIT VARIABLES FROM REQUEST
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = parseInt(req.query.limit, 10) || 9; // Configurable items-per-page constant
+    const skip = (page - 1) * limit;
+
+    // 3. EXECUTE PARALLEL DATABASE CONTEXT STREAMS (Performance Optimized)
+    const [books, totalCount, allCategories] = await Promise.all([
+      // Stream A: Fetch current slice page of items matching filters
+      Book.find(query).skip(skip).limit(limit).sort({ createdAt: -1 }),
+
+      // Stream B: Fetch global document count matching the selected filters
+      Book.countDocuments(query),
+
+      // Stream C: GLOBAL SOLUTION — Aggregate all categories in the database unaffected by limits
+      Book.distinct("category"),
+    ]);
+
+    // 4. RESPOND WITH COMPREHENSIVE CONTROL PAYLOAD OVER THE WIRE
+    res.status(200).json({
+      books,
+      totalCount,
+      allCategories: allCategories.filter(Boolean), // Wipe out null/empty strings
+    });
+  } catch (error) {
+    res
+      .status(500)
+      .json({ error: "Ecosystem failed to process book query payload." });
+  }
+});
 async function main() {
   try {
     await mongoose.connect(process.env.DB_URL);
