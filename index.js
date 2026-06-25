@@ -939,6 +939,415 @@ app.put("/books/:id", requireAuth, async (req, res) => {
   }
 });
 
+// 1. GET ALL REVIEWS COMPRESSED BY THE ACTIVE USER
+app.get("/reviews/me", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // Search books collection for sub-document nested matches authored by this user
+    // We populate the parent book details context to display its title & author info on the dashboard
+    const booksWithMyReviews = await Book.find({
+      "reviews.userId": userId,
+    }).select("title author reviews");
+
+    // Flatten and transform the nested sub-documents out for easy frontend looping
+    let myReviews = [];
+    booksWithMyReviews.forEach((book) => {
+      book.reviews.forEach((rev) => {
+        if (String(rev.userId) === String(userId)) {
+          myReviews.push({
+            _id: rev._id,
+            comment: rev.comment,
+            rating: rev.rating,
+            bookId: { _id: book._id, title: book.title, author: book.author },
+          });
+        }
+      });
+    });
+
+    return res.status(200).json(myReviews);
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+});
+
+// 2. PUT: EDIT/UPDATE TARGET REVIEW SPECIFICS
+app.put("/reviews/:id", requireAuth, async (req, res) => {
+  try {
+    const reviewId = req.params.id;
+    const { comment, rating } = req.body;
+    const userId = req.user.id;
+
+    // Find the master book entry containing the targeted sub-document review identifier
+    const book = await Book.findOne({ "reviews._id": reviewId });
+    if (!book)
+      return res
+        .status(404)
+        .json({ message: "Review matching index missing." });
+
+    // Locate the explicit sub-document reference in the Mongoose array
+    const review = book.reviews.id(reviewId);
+
+    // Authorization security guardrail check
+    if (String(review.userId) !== String(userId)) {
+      return res
+        .status(403)
+        .json({ message: "Unauthorized operation constraint." });
+    }
+
+    // Apply the fresh updates
+    review.comment = comment;
+    review.rating = rating;
+    await book.save();
+
+    return res
+      .status(200)
+      .json({ success: true, message: "Review updated successfully." });
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+});
+
+// 3. DELETE: ERASE REVIEW SUB-DOCUMENT ENTRIES
+app.delete("/reviews/:id", requireAuth, async (req, res) => {
+  try {
+    const reviewId = req.params.id;
+    const userId = req.user.id;
+
+    const book = await Book.findOne({ "reviews._id": reviewId });
+    if (!book)
+      return res.status(404).json({ message: "Review index not found." });
+
+    const review = book.reviews.id(reviewId);
+    if (String(review.userId) !== String(userId)) {
+      return res.status(403).json({ message: "Access tracking violation." });
+    }
+
+    // Pull/remove sub-document cleanly using Mongoose's built-in subdoc remover helper
+    review.deleteOne();
+    await book.save();
+
+    return res
+      .status(200)
+      .json({ success: true, message: "Review wiped cleanly." });
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+});
+
+// ────────────────────────────────────────────────────────
+// USER OVERVIEW METRICS ENDPOINT
+// ────────────────────────────────────────────────────────
+
+app.get("/dashboard/user", requireAuth, async (req, res) => {
+  try {
+    const rawUserId = req.user.id;
+
+    // 1. Calculate Real Total Spent (Handles String/Number and ObjectId/String mismatches)
+    const totalSpentData = await Transaction.aggregate([
+      {
+        $match: {
+          $and: [
+            { status: { $regex: /^completed$/i } },
+            {
+              $or: [
+                { userId: rawUserId }, // Matches if stored as a raw String
+                { userId: new mongoose.Types.ObjectId(rawUserId) }, // Matches if stored as an ObjectId
+              ],
+            },
+          ],
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          total: {
+            $sum: {
+              // Enforces conversion to double/number if it was stored as a string "20"
+              $toDouble: { $ifNull: ["$amountPaid", 0] },
+            },
+          },
+        },
+      },
+    ]);
+    const totalSpent = totalSpentData.length > 0 ? totalSpentData[0].total : 0;
+
+    // 2. Count Real Books and Live Deliveries
+    const totalBooksRead = await Transaction.countDocuments({
+      userId: rawUserId,
+      status: { $regex: /^completed$/i },
+    });
+
+    const pendingDeliveries = await Delivery.countDocuments({
+      userId: rawUserId,
+      status: { $regex: /^(?!delivered$).*$/i },
+    });
+
+    const activeBorrowing = await Delivery.countDocuments({
+      userId: rawUserId,
+      status: { $regex: /^delivered$/i },
+    });
+
+    // 3. Robust Monthly Spending Chart Aggregator
+    const monthlySpending = await Transaction.aggregate([
+      {
+        $match: {
+          $and: [
+            { status: { $regex: /^completed$/i } },
+            {
+              $or: [
+                { userId: rawUserId },
+                { userId: new mongoose.Types.ObjectId(rawUserId) },
+              ],
+            },
+          ],
+        },
+      },
+      {
+        $group: {
+          _id: { $dateToString: { format: "%b", date: "$createdAt" } },
+          amount: { $sum: { $toDouble: "$amountPaid" } },
+        },
+      },
+      {
+        $project: {
+          month: { $ifNull: ["$_id", "Unknown"] },
+          amount: 1,
+          _id: 0,
+        },
+      },
+      { $sort: { month: 1 } },
+    ]);
+
+    // 4. Robust Category Distribution Pie Chart Aggregator
+    const categoryDistribution = await Transaction.aggregate([
+      {
+        $match: {
+          $and: [
+            { status: { $regex: /^completed$/i } },
+            {
+              $or: [
+                { userId: rawUserId },
+                { userId: new mongoose.Types.ObjectId(rawUserId) },
+              ],
+            },
+          ],
+        },
+      },
+      {
+        $lookup: {
+          from: "books",
+          localField: "bookId",
+          foreignField: "_id",
+          as: "bookDetails",
+        },
+      },
+      { $unwind: { path: "$bookDetails", preserveNullAndEmptyArrays: true } },
+      {
+        $group: {
+          _id: { $ifNull: ["$bookDetails.category", "Uncategorized"] },
+          count: { $sum: 1 },
+        },
+      },
+      { $project: { name: "$_id", count: 1, _id: 0 } },
+    ]);
+
+    return res.status(200).json({
+      stats: {
+        totalSpent,
+        totalBooksRead,
+        pendingDeliveries,
+        activeBorrowing,
+      },
+      charts: {
+        monthlySpending,
+        categoryDistribution,
+      },
+    });
+  } catch (err) {
+    console.error("User Dashboard Crash Recovery:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+// ────────────────────────────────────────────────────────
+// LIBRARIAN OVERVIEW METRICS ENDPOINT
+// ────────────────────────────────────────────────────────
+app.get("/dashboard/librarian", requireAuth, async (req, res) => {
+  try {
+    const rawLibrarianId = req.user.id;
+
+    // 1. Calculate Total Sales Revenue safely
+    const revenueData = await Transaction.aggregate([
+      {
+        $match: {
+          status: { $regex: /^completed$/i },
+        },
+      },
+      {
+        $lookup: {
+          from: "books",
+          localField: "bookId",
+          foreignField: "_id",
+          as: "bookDetails",
+        },
+      },
+      { $unwind: "$bookDetails" },
+      {
+        // Filter transactions for books that belong to this librarian owner
+        $match: {
+          $or: [
+            { "bookDetails.ownerId": rawLibrarianId },
+            {
+              "bookDetails.ownerId": new mongoose.Types.ObjectId(
+                rawLibrarianId,
+              ),
+            },
+          ],
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          total: { $sum: { $toDouble: { $ifNull: ["$amountPaid", 0] } } },
+        },
+      },
+    ]);
+    const totalSales = revenueData.length > 0 ? revenueData[0].total : 0;
+
+    // 2. Counts for Inventory & States
+    const totalBooks = await Book.countDocuments({
+      $or: [
+        { ownerId: rawLibrarianId },
+        { ownerId: new mongoose.Types.ObjectId(rawLibrarianId) },
+      ],
+    });
+
+    const pendingRequests = await Delivery.countDocuments({
+      status: { $regex: /^pending$/i },
+    });
+    const activeDeliveries = await Delivery.countDocuments({
+      status: { $regex: /^shipped$/i },
+    });
+
+    // 3. Circulation History (Bar Chart Feed)
+    const circulationData = await Delivery.aggregate([
+      {
+        $group: {
+          _id: { $dateToString: { format: "%b", date: "$createdAt" } },
+          requests: { $sum: 1 },
+        },
+      },
+      {
+        $project: {
+          day: { $ifNull: ["$_id", "Unknown"] },
+          requests: 1,
+          _id: 0,
+        },
+      },
+      { $sort: { day: 1 } },
+    ]);
+
+    // 4. Stock Growth Analysis (Area Chart Feed)
+    const stockGrowth = await Book.aggregate([
+      {
+        $match: {
+          $or: [
+            { ownerId: rawLibrarianId },
+            { ownerId: new mongoose.Types.ObjectId(rawLibrarianId) },
+          ],
+        },
+      },
+      {
+        $group: {
+          _id: { $dateToString: { format: "%b", date: "$createdAt" } },
+          added: { $sum: 1 },
+        },
+      },
+      {
+        $project: { week: { $ifNull: ["$_id", "Unknown"] }, added: 1, _id: 0 },
+      },
+      { $sort: { week: 1 } },
+    ]);
+
+    return res.status(200).json({
+      stats: { totalSales, totalBooks, pendingRequests, activeDeliveries },
+      charts: { circulationData, stockGrowth },
+    });
+  } catch (err) {
+    console.error("Librarian Dashboard Aggregation Error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ────────────────────────────────────────────────────────
+// GLOBAL SYSTEM ADMIN METRICS ENDPOINT
+// ────────────────────────────────────────────────────────
+app.get("/dashboard/admin", requireAuth, async (req, res) => {
+  try {
+    // 1. Calculate Gross Platform GMV (All processed transaction payments)
+    const gmvData = await Transaction.aggregate([
+      { $match: { status: { $regex: /^completed$/i } } },
+      {
+        $group: {
+          _id: null,
+          total: { $sum: { $toDouble: { $ifNull: ["$amountPaid", 0] } } },
+        },
+      },
+    ]);
+    const platformGmv = gmvData.length > 0 ? gmvData[0].total : 0;
+
+    // 2. Global Core Counts
+    const totalUsers = await User.countDocuments();
+    const totalBooks = await Book.countDocuments();
+    // Assuming you flag unapproved books or listings with an approval Status:
+    const pendingApprovals = await Book.countDocuments({ isApproved: false });
+
+    // 3. User Registration Volume Shifts (Line Chart Feed)
+    const userTrends = await User.aggregate([
+      {
+        $group: {
+          _id: { $dateToString: { format: "%b", date: "$createdAt" } },
+          newUsers: { $sum: 1 },
+        },
+      },
+      {
+        $project: {
+          month: { $ifNull: ["$_id", "Unknown"] },
+          newUsers: 1,
+          _id: 0,
+        },
+      },
+      { $sort: { month: 1 } },
+    ]);
+
+    // 4. Site-wide Financial Velocity Flow (Bar Chart Feed)
+    const revenueVelocity = await Transaction.aggregate([
+      { $match: { status: { $regex: /^completed$/i } } },
+      {
+        $group: {
+          _id: { $dateToString: { format: "%b", date: "$createdAt" } },
+          grossAmount: { $sum: { $toDouble: "$amountPaid" } },
+        },
+      },
+      {
+        $project: {
+          month: { $ifNull: ["$_id", "Unknown"] },
+          grossAmount: 1,
+          _id: 0,
+        },
+      },
+      { $sort: { month: 1 } },
+    ]);
+
+    return res.status(200).json({
+      stats: { totalUsers, totalBooks, pendingApprovals, platformGmv },
+      charts: { userRegistrationTrends: userTrends, revenueVelocity },
+    });
+  } catch (err) {
+    console.error("Admin Dashboard Global Error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
 async function main() {
   try {
     await mongoose.connect(process.env.DB_URL);
