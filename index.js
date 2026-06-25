@@ -343,46 +343,65 @@ app.get("/books", async (req, res) => {
 });
 
 // GET: Fetch Book Details Wrapper Payload
-app.get("/books/:id", requireAuth, async (req, res) => {
+const { getSession } = require("./services/auth.service");
+
+// GET: Fetch Book Details Wrapper Payload
+app.get("/books/:id", async (req, res) => {
   try {
     const bookId = req.params.id;
-    const userId = req.user.id; // Extracted from auth middleware token
+
+    // Try to get session, but don't block guests
+    const session = await getSession(req.headers);
+
+    const user = session?.user || null;
+    const userId = user?.id || null;
 
     // 1. Fetch the book profile document
     const book = await Book.findById(bookId);
+
     if (!book) {
-      return res.status(404).json({ message: "Catalog item context missing." });
+      return res.status(404).json({
+        message: "Catalog item context missing.",
+      });
     }
 
-    // 2. Check if a payment transaction has been processed
-    const transaction = await Transaction.findOne({
-      bookId: bookId,
-      userId: userId,
-      status: "completed",
-    });
+    // Default values for guests
+    let transaction = null;
+    let deliveryRecord = null;
 
-    // 3. Query the deliveries collection using the book and user pairing
-    // (Replace 'Delivery' with your exact imported Mongoose model name)
-    const deliveryRecord = await Delivery.findOne({
-      bookId: bookId,
-      userId: userId,
-    });
+    // 2. Run user-specific checks only if logged in
+    if (userId) {
+      transaction = await Transaction.findOne({
+        bookId,
+        userId,
+        status: "completed",
+      });
 
-    // 4. Return wrapper along with dynamic UI permissions flags
+      deliveryRecord = await Delivery.findOne({
+        bookId,
+        userId,
+      });
+    }
+
+    // 3. Return wrapper payload
     res.status(200).json({
       book,
-      isLibrarianOwner: String(book.ownerId) === String(userId),
 
-      // Locks payment button if a completed transaction document is logged
+      // Frontend uses this
+      isAuthenticated: !!userId,
+
+      isLibrarianOwner: !!userId && String(book.ownerId) === String(userId),
+
       hasRequestedDelivery: !!transaction,
 
-      // Unlocks reviews ONLY if delivery document exists and its status key matches "delivered"
-      // (Change "delivered" if your delivery model uses a different keyword like "Completed" or "Shipped")
-      canReview: deliveryRecord && deliveryRecord.status === "delivered",
+      canReview: !!deliveryRecord && deliveryRecord.status === "delivered",
     });
   } catch (err) {
     console.error("Error evaluating book detail flags:", err);
-    res.status(500).json({ error: err.message });
+
+    res.status(500).json({
+      error: err.message,
+    });
   }
 });
 
