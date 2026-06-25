@@ -386,25 +386,47 @@ app.get("/books/:id", requireAuth, async (req, res) => {
   }
 });
 
-
 app.post("/books/:id/reviews", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
+    const { comment, rating } = req.body;
     const userId = req.user.id;
+    const userName = req.user.name || "Anonymous Reader"; // If you track names
 
-    // Verify package is arrived via deliveries collection
+    // 1. Guardrail validation check
     const deliveryRecord = await Delivery.findOne({ bookId: id, userId });
-
     if (!deliveryRecord || deliveryRecord.status !== "delivered") {
       return res.status(403).json({
         message:
-          "Action Blocked: Reviews are unlocked only after your package status shows delivered.",
+          "Action Blocked: Reviews are unlocked only after delivery confirmation.",
       });
     }
 
-    // Continue with your existing code logic to push the review parameters...
+    const book = await Book.findById(id);
+    if (!book) {
+      return res.status(404).json({ message: "Book not found." });
+    }
+
+    // 2. Append review payload to arrays
+    book.reviews.push({
+      userId,
+      userName,
+      comment,
+      rating,
+      createdAt: new Date(),
+    });
+
+    await book.save();
+
+    // 3. THE FIX: Explicitly send back a successful status and payload
+    return res.status(200).json({
+      success: true,
+      message: "Review logged successfully.",
+    });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("Review saving error:", err);
+    // Crucial: Catch blocks must also return a response so they don't hang!
+    return res.status(500).json({ message: err.message });
   }
 });
 
