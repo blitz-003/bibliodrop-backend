@@ -2,6 +2,11 @@ require("dotenv").config();
 
 const requireAuth = require("./middleware/requireAuth.js");
 const requireRole = require("./middleware/requireRole.js");
+const { createRemoteJWKSet, jwtVerify } = require("jose-cjs");
+
+const JWKS = createRemoteJWKSet(
+  new URL(`${process.env.FRONTEND_URL}/api/auth/jwks`),
+);
 
 const express = require("express");
 const mongoose = require("mongoose");
@@ -343,22 +348,38 @@ app.get("/books", async (req, res) => {
 });
 
 // GET: Fetch Book Details Wrapper Payload
-const { getSession } = require("./services/auth.service");
-
-// GET: Fetch Book Details Wrapper Payload
 app.get("/books/:id", async (req, res) => {
   try {
     const bookId = req.params.id;
+    let userId = null;
 
-    // Try to get session, but don't block guests
-    const session = await getSession(req.headers);
+    // 1. Manually check for the Bearer token exactly like your middleware does
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith("Bearer ")) {
+      try {
+        const token = authHeader.split(" ")[1];
+        console.log("token", token);
+        // Verify the token against your JWKS provider
+        const { payload } = await jwtVerify(token, JWKS);
+        console.log("payload", payload);
+        // Extract the user ID based on how your JWT structure formats it
+        // Look closely at your JWT payload format: it could be payload.id or payload.sub
+        userId = payload?.id || payload?.sub || null;
 
-    const user = session?.user || null;
-    const userId = user?.id || null;
+        console.log("✅ Authenticated Backend User ID:", userId);
+      } catch (jwtErr) {
+        // If the token is expired or corrupt, log it but don't crash, treat them as a guest
+        console.warn(
+          "⚠️ Token present but failed verification:",
+          jwtErr.message,
+        );
+      }
+    } else {
+      console.log("ℹ️ No token provided. Processing request as a Guest.");
+    }
 
-    // 1. Fetch the book profile document
+    // 2. Fetch the book profile document
     const book = await Book.findById(bookId);
-
     if (!book) {
       return res.status(404).json({
         message: "Catalog item context missing.",
@@ -369,7 +390,7 @@ app.get("/books/:id", async (req, res) => {
     let transaction = null;
     let deliveryRecord = null;
 
-    // 2. Run user-specific checks only if logged in
+    // 3. Run user-specific checks if we successfully extracted a verified userId
     if (userId) {
       transaction = await Transaction.findOne({
         bookId,
@@ -381,24 +402,22 @@ app.get("/books/:id", async (req, res) => {
         bookId,
         userId,
       });
+
+      console.log(
+        `🔍 Checking DB -> Transaction found: ${!!transaction}, Delivery found: ${!!deliveryRecord}`,
+      );
     }
 
-    // 3. Return wrapper payload
+    // 4. Return wrapper payload
     res.status(200).json({
       book,
-
-      // Frontend uses this
       isAuthenticated: !!userId,
-
       isLibrarianOwner: !!userId && String(book.ownerId) === String(userId),
-
       hasRequestedDelivery: !!transaction,
-
       canReview: !!deliveryRecord && deliveryRecord.status === "delivered",
     });
   } catch (err) {
     console.error("Error evaluating book detail flags:", err);
-
     res.status(500).json({
       error: err.message,
     });
@@ -1059,22 +1078,27 @@ app.delete("/reviews/:id", requireAuth, async (req, res) => {
 // ────────────────────────────────────────────────────────
 
 app.get("/dashboard/user", requireAuth, async (req, res) => {
+  console.log("came here");
+
   try {
     const rawUserId = req.user.id;
+    console.log("User ID:", rawUserId);
 
-    // 1. Calculate Real Total Spent (Handles String/Number and ObjectId/String mismatches)
+    const userIdConditions = [{ userId: rawUserId }];
+
+    if (mongoose.Types.ObjectId.isValid(rawUserId)) {
+      userIdConditions.push({
+        userId: new mongoose.Types.ObjectId(rawUserId),
+      });
+    }
+
+    console.log("Running totalSpentData...");
+
     const totalSpentData = await Transaction.aggregate([
       {
         $match: {
-          $and: [
-            { status: { $regex: /^completed$/i } },
-            {
-              $or: [
-                { userId: rawUserId }, // Matches if stored as a raw String
-                { userId: new mongoose.Types.ObjectId(rawUserId) }, // Matches if stored as an ObjectId
-              ],
-            },
-          ],
+          status: { $regex: /^completed$/i },
+          $or: userIdConditions,
         },
       },
       {
@@ -1082,75 +1106,101 @@ app.get("/dashboard/user", requireAuth, async (req, res) => {
           _id: null,
           total: {
             $sum: {
-              // Enforces conversion to double/number if it was stored as a string "20"
-              $toDouble: { $ifNull: ["$amountPaid", 0] },
+              $convert: {
+                input: "$amountPaid",
+                to: "double",
+                onError: 0,
+                onNull: 0,
+              },
             },
           },
         },
       },
     ]);
+
+    console.log("✓ totalSpentData");
+
     const totalSpent = totalSpentData.length > 0 ? totalSpentData[0].total : 0;
 
-    // 2. Count Real Books and Live Deliveries
+    console.log("Running totalBooksRead...");
+
     const totalBooksRead = await Transaction.countDocuments({
       userId: rawUserId,
       status: { $regex: /^completed$/i },
     });
+
+    console.log("✓ totalBooksRead");
+
+    console.log("Running pendingDeliveries...");
 
     const pendingDeliveries = await Delivery.countDocuments({
       userId: rawUserId,
       status: { $regex: /^(?!delivered$).*$/i },
     });
 
+    console.log("✓ pendingDeliveries");
+
+    console.log("Running activeBorrowing...");
+
     const activeBorrowing = await Delivery.countDocuments({
       userId: rawUserId,
       status: { $regex: /^delivered$/i },
     });
 
-    // 3. Robust Monthly Spending Chart Aggregator
+    console.log("✓ activeBorrowing");
+
+    console.log("Running monthlySpending...");
+
     const monthlySpending = await Transaction.aggregate([
       {
         $match: {
-          $and: [
-            { status: { $regex: /^completed$/i } },
-            {
-              $or: [
-                { userId: rawUserId },
-                { userId: new mongoose.Types.ObjectId(rawUserId) },
-              ],
-            },
-          ],
+          status: { $regex: /^completed$/i },
+          $or: userIdConditions,
         },
       },
       {
         $group: {
-          _id: { $dateToString: { format: "%b", date: "$createdAt" } },
-          amount: { $sum: { $toDouble: "$amountPaid" } },
+          _id: {
+            $dateToString: {
+              format: "%b",
+              date: "$createdAt",
+            },
+          },
+          amount: {
+            $sum: {
+              $convert: {
+                input: "$amountPaid",
+                to: "double",
+                onError: 0,
+                onNull: 0,
+              },
+            },
+          },
         },
       },
       {
         $project: {
-          month: { $ifNull: ["$_id", "Unknown"] },
+          month: "$_id",
           amount: 1,
           _id: 0,
         },
       },
-      { $sort: { month: 1 } },
+      {
+        $sort: {
+          month: 1,
+        },
+      },
     ]);
 
-    // 4. Robust Category Distribution Pie Chart Aggregator
+    console.log("✓ monthlySpending");
+
+    console.log("Running categoryDistribution...");
+
     const categoryDistribution = await Transaction.aggregate([
       {
         $match: {
-          $and: [
-            { status: { $regex: /^completed$/i } },
-            {
-              $or: [
-                { userId: rawUserId },
-                { userId: new mongoose.Types.ObjectId(rawUserId) },
-              ],
-            },
-          ],
+          status: { $regex: /^completed$/i },
+          $or: userIdConditions,
         },
       },
       {
@@ -1161,15 +1211,33 @@ app.get("/dashboard/user", requireAuth, async (req, res) => {
           as: "bookDetails",
         },
       },
-      { $unwind: { path: "$bookDetails", preserveNullAndEmptyArrays: true } },
       {
-        $group: {
-          _id: { $ifNull: ["$bookDetails.category", "Uncategorized"] },
-          count: { $sum: 1 },
+        $unwind: {
+          path: "$bookDetails",
+          preserveNullAndEmptyArrays: true,
         },
       },
-      { $project: { name: "$_id", count: 1, _id: 0 } },
+      {
+        $group: {
+          _id: {
+            $ifNull: ["$bookDetails.category", "Uncategorized"],
+          },
+          count: {
+            $sum: 1,
+          },
+        },
+      },
+      {
+        $project: {
+          name: "$_id",
+          count: 1,
+          _id: 0,
+        },
+      },
     ]);
+
+    console.log("✓ categoryDistribution");
+    console.log("Sending response...");
 
     return res.status(200).json({
       stats: {
@@ -1184,8 +1252,12 @@ app.get("/dashboard/user", requireAuth, async (req, res) => {
       },
     });
   } catch (err) {
-    console.error("User Dashboard Crash Recovery:", err);
-    return res.status(500).json({ error: err.message });
+    console.error("========== DASHBOARD ERROR ==========");
+    console.error(err);
+    console.error(err.stack);
+    return res.status(500).json({
+      message: err.message,
+    });
   }
 });
 // ────────────────────────────────────────────────────────
@@ -1319,7 +1391,9 @@ app.get("/dashboard/admin", requireAuth, async (req, res) => {
     const totalUsers = await User.countDocuments();
     const totalBooks = await Book.countDocuments();
     // Assuming you flag unapproved books or listings with an approval Status:
-    const pendingApprovals = await Book.countDocuments({ isApproved: false });
+    const pendingApprovals = await Book.countDocuments({
+      publishStatus: { $regex: /^pending$/i },
+    });
 
     // 3. User Registration Volume Shifts (Line Chart Feed)
     const userTrends = await User.aggregate([

@@ -1,24 +1,30 @@
-const { getSession } = require("../services/auth.service");
+const { createRemoteJWKSet, jwtVerify } = require("jose-cjs");
+
+const JWKS = createRemoteJWKSet(
+  new URL(`${process.env.FRONTEND_URL}/api/auth/jwks`),
+);
 
 async function requireAuth(req, res, next) {
   try {
-    console.log("COOKIE HEADER:", req.headers.cookie);
+    const authHeader = req.headers.authorization;
 
-    const session = await getSession(req.headers);
-
-    console.log("SESSION:", session);
-
-    if (!session?.user) {
+    if (!authHeader?.startsWith("Bearer ")) {
       return res.status(401).json({
         message: "Unauthorized",
       });
     }
 
-    req.user = session.user;
-    console.log("after");
+    const token = authHeader.split(" ")[1];
+
+    const { payload } = await jwtVerify(token, JWKS);
+
+    req.user = payload;
+
     next();
   } catch (err) {
-    next(err);
+    return res.status(401).json({
+      message: "Invalid token",
+    });
   }
 }
 
