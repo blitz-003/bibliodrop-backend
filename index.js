@@ -321,34 +321,96 @@ app.get("/books", async (req, res) => {
   try {
     const { search, category, available } = req.query;
 
-    let query = {};
+    // Build query
+    const query = {
+      publishStatus: "approved",
+    };
 
-    //  Search by title (case-insensitive)
+    // Search by title (case-insensitive)
     if (search) {
       query.title = { $regex: search, $options: "i" };
     }
 
-    // Category filter
+    // Filter by category
     if (category) {
       query.category = category;
     }
 
-    // Availability filter (convert string → boolean)
+    // Filter by availability
     if (available !== undefined) {
       query.available = available === "true";
     }
 
-    query.publishStatus = "approved";
+    // Pagination
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = parseInt(req.query.limit, 10) || 9;
+    const skip = (page - 1) * limit;
 
-    const books = await Book.find(query);
+    console.log({
+      page,
+      limit,
+      skip,
+      query,
+    });
 
-    res.json(books);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+    // Fetch paginated books + metadata
+    const [books, totalCount, allCategories] = await Promise.all([
+      Book.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit),
+
+      Book.countDocuments(query),
+
+      Book.distinct("category"),
+    ]);
+
+    res.status(200).json({
+      books,
+      totalCount,
+      currentPage: page,
+      totalPages: Math.ceil(totalCount / limit),
+      allCategories: allCategories.filter(Boolean),
+    });
+  } catch (error) {
+    console.error("Error fetching books:", error);
+
+    res.status(500).json({
+      error: "Failed to fetch books.",
+    });
   }
 });
 
-// GET: Fetch Book Details Wrapper Payload
+//2nd /books
+// app.get("/books", async (req, res) => {
+//   console.log("2nd books route");
+//   try {
+//     const { search, category, available } = req.query;
+
+//     let query = {};
+
+//     //  Search by title (case-insensitive)
+//     if (search) {
+//       query.title = { $regex: search, $options: "i" };
+//     }
+
+//     // Category filter
+//     if (category) {
+//       query.category = category;
+//     }
+
+//     // Availability filter (convert string → boolean)
+//     if (available !== undefined) {
+//       query.available = available === "true";
+//     }
+
+//     query.publishStatus = "approved";
+
+//     const books = await Book.find(query);
+
+//     res.json(books);
+//   } catch (err) {
+//     res.status(500).json({ error: err.message });
+//   }
+// });
+
 app.get("/books/:id", async (req, res) => {
   try {
     const bookId = req.params.id;
@@ -1443,54 +1505,6 @@ app.get("/dashboard/admin", requireAuth, async (req, res) => {
   }
 });
 
-app.get("/books", async (req, res) => {
-  try {
-    const { search, category, available } = req.query;
-
-    // 1. DYNAMIC SEARCH & FILTER MONGOOSE QUERY OBJECT
-    let query = {};
-
-    if (search) {
-      query.title = { $regex: search, $options: "i" }; // Case-insensitive title lookup
-    }
-
-    if (category) {
-      query.category = category;
-    }
-
-    if (available !== undefined) {
-      query.available = available === "true";
-    }
-
-    // 2. PARSE CONFIGURABLE PAGINATION LIMIT VARIABLES FROM REQUEST
-    const page = parseInt(req.query.page, 10) || 1;
-    const limit = parseInt(req.query.limit, 10) || 9; // Configurable items-per-page constant
-    const skip = (page - 1) * limit;
-
-    // 3. EXECUTE PARALLEL DATABASE CONTEXT STREAMS (Performance Optimized)
-    const [books, totalCount, allCategories] = await Promise.all([
-      // Stream A: Fetch current slice page of items matching filters
-      Book.find(query).skip(skip).limit(limit).sort({ createdAt: -1 }),
-
-      // Stream B: Fetch global document count matching the selected filters
-      Book.countDocuments(query),
-
-      // Stream C: GLOBAL SOLUTION — Aggregate all categories in the database unaffected by limits
-      Book.distinct("category"),
-    ]);
-
-    // 4. RESPOND WITH COMPREHENSIVE CONTROL PAYLOAD OVER THE WIRE
-    res.status(200).json({
-      books,
-      totalCount,
-      allCategories: allCategories.filter(Boolean), // Wipe out null/empty strings
-    });
-  } catch (error) {
-    res
-      .status(500)
-      .json({ error: "Ecosystem failed to process book query payload." });
-  }
-});
 async function main() {
   try {
     await mongoose.connect(process.env.DB_URL);
