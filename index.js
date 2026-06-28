@@ -368,9 +368,9 @@ app.get("/books", async (req, res) => {
     if (sort === "oldest") {
       sortQuery = { createdAt: 1 };
     } else if (sort === "price_low") {
-      sortQuery = { price: 1 };
+      sortQuery = { deliveryFee: 1 };
     } else if (sort === "price_high") {
-      sortQuery = { price: -1 };
+      sortQuery = { deliveryFee: -1 };
     }
 
     // Safe pagination values setup fallback structures parsing engine
