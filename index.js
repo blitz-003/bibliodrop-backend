@@ -1166,8 +1166,6 @@ app.delete("/reviews/:id", requireAuth, async (req, res) => {
 // ────────────────────────────────────────────────────────
 
 app.get("/dashboard/user", requireAuth, async (req, res) => {
-  console.log("came here");
-
   try {
     const rawUserId = req.user.id;
     console.log("User ID:", rawUserId);
@@ -1206,15 +1204,13 @@ app.get("/dashboard/user", requireAuth, async (req, res) => {
       },
     ]);
 
-    console.log("✓ totalSpentData");
-
     const totalSpent = totalSpentData.length > 0 ? totalSpentData[0].total : 0;
 
     console.log("Running totalBooksRead...");
 
-    const totalBooksRead = await Transaction.countDocuments({
+    const totalBooksRead = await Delivery.countDocuments({
       userId: rawUserId,
-      status: { $regex: /^completed$/i },
+      status: { $regex: /^delivered$/i },
     });
 
     console.log("✓ totalBooksRead");
@@ -1394,6 +1390,7 @@ app.get("/dashboard/librarian", requireAuth, async (req, res) => {
     const totalSales = revenueData.length > 0 ? revenueData[0].total : 0;
 
     // 2. Counts for Inventory & States
+    // 2. Counts for Inventory & States
     const totalBooks = await Book.countDocuments({
       $or: [
         { ownerId: rawLibrarianId },
@@ -1401,13 +1398,69 @@ app.get("/dashboard/librarian", requireAuth, async (req, res) => {
       ],
     });
 
-    const pendingRequests = await Delivery.countDocuments({
-      status: { $regex: /^pending$/i },
-    });
-    const activeDeliveries = await Delivery.countDocuments({
-      status: { $regex: /^shipped$/i },
-    });
+    // 3. Isolated Pending Requests Count (Filtered by Book Owner & status 'pending')
+    const pendingData = await Delivery.aggregate([
+      {
+        $match: {
+          status: { $regex: /^pending$/i },
+        },
+      },
+      {
+        $lookup: {
+          from: "books",
+          localField: "bookId", // Replace with your exact field if named differently (e.g., "transactionId")
+          foreignField: "_id",
+          as: "bookDetails",
+        },
+      },
+      { $unwind: "$bookDetails" },
+      {
+        $match: {
+          $or: [
+            { "bookDetails.ownerId": rawLibrarianId },
+            {
+              "bookDetails.ownerId": new mongoose.Types.ObjectId(
+                rawLibrarianId,
+              ),
+            },
+          ],
+        },
+      },
+      { $count: "count" },
+    ]);
+    const pendingRequests = pendingData.length > 0 ? pendingData[0].count : 0;
 
+    // 4. Isolated Active Deliveries Count (Filtered by Book Owner & status 'dispatched')
+    const activeData = await Delivery.aggregate([
+      {
+        $match: {
+          status: { $regex: /^dispatched$/i }, // Changed string match from 'shipped' to 'dispatched'
+        },
+      },
+      {
+        $lookup: {
+          from: "books",
+          localField: "bookId",
+          foreignField: "_id",
+          as: "bookDetails",
+        },
+      },
+      { $unwind: "$bookDetails" },
+      {
+        $match: {
+          $or: [
+            { "bookDetails.ownerId": rawLibrarianId },
+            {
+              "bookDetails.ownerId": new mongoose.Types.ObjectId(
+                rawLibrarianId,
+              ),
+            },
+          ],
+        },
+      },
+      { $count: "count" },
+    ]);
+    const activeDeliveries = activeData.length > 0 ? activeData[0].count : 0;
     // 3. Circulation History (Bar Chart Feed)
     const circulationData = await Delivery.aggregate([
       {
