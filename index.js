@@ -319,31 +319,63 @@ app.get("/", (req, res) => {
 
 app.get("/books", async (req, res) => {
   try {
-    const { search, category, available } = req.query;
+    const {
+      search,
+      category,
+      available,
+      sort,
+      minDeliveryFee,
+      maxDeliveryFee,
+    } = req.query;
 
-    // Build query
+    // Build functional query object matrix base
     const query = {
       publishStatus: "approved",
     };
 
-    // Search by title (case-insensitive)
+    // Search query titles filters (case-insensitive regex engine parsing)
     if (search) {
       query.title = { $regex: search, $options: "i" };
     }
 
-    // Filter by category
+    // Filter validation logic by explicitly targeted categories
     if (category) {
       query.category = category;
     }
 
-    // Filter by availability
+    // Filter tracking by inventory asset availability flags
     if (available !== undefined) {
       query.available = available === "true";
     }
 
-    // Pagination
+    // Dynamic compilation logic for delivery fee range inputs
+    if (minDeliveryFee !== undefined || maxDeliveryFee !== undefined) {
+      query.deliveryFee = {};
+      if (minDeliveryFee !== undefined && minDeliveryFee !== "") {
+        query.deliveryFee.$gte = parseFloat(minDeliveryFee);
+      }
+      if (maxDeliveryFee !== undefined && maxDeliveryFee !== "") {
+        query.deliveryFee.$lte = parseFloat(maxDeliveryFee);
+      }
+      // If object remains unpopulated, clean key reference away cleanly
+      if (Object.keys(query.deliveryFee).length === 0) {
+        delete query.deliveryFee;
+      }
+    }
+
+    // Adaptive Sort logic matrices parser setup
+    let sortQuery = { createdAt: -1 }; // Default fallback structure logic
+    if (sort === "oldest") {
+      sortQuery = { createdAt: 1 };
+    } else if (sort === "price_low") {
+      sortQuery = { price: 1 };
+    } else if (sort === "price_high") {
+      sortQuery = { price: -1 };
+    }
+
+    // Safe pagination values setup fallback structures parsing engine
     const page = parseInt(req.query.page, 10) || 1;
-    const limit = parseInt(req.query.limit, 10) || 9;
+    const limit = parseInt(req.query.limit, 10) || 8; // Synced with frontend parameters
     const skip = (page - 1) * limit;
 
     console.log({
@@ -351,14 +383,13 @@ app.get("/books", async (req, res) => {
       limit,
       skip,
       query,
+      sortQuery,
     });
 
-    // Fetch paginated books + metadata
+    // Execute database operations concurrently
     const [books, totalCount, allCategories] = await Promise.all([
-      Book.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit),
-
+      Book.find(query).sort(sortQuery).skip(skip).limit(limit),
       Book.countDocuments(query),
-
       Book.distinct("category"),
     ]);
 
@@ -371,7 +402,6 @@ app.get("/books", async (req, res) => {
     });
   } catch (error) {
     console.error("Error fetching books:", error);
-
     res.status(500).json({
       error: "Failed to fetch books.",
     });
@@ -428,17 +458,12 @@ app.get("/books/:id", async (req, res) => {
         // Extract the user ID based on how your JWT structure formats it
         // Look closely at your JWT payload format: it could be payload.id or payload.sub
         userId = payload?.id || payload?.sub || null;
-
-        console.log("✅ Authenticated Backend User ID:", userId);
       } catch (jwtErr) {
         // If the token is expired or corrupt, log it but don't crash, treat them as a guest
-        console.warn(
-          "⚠️ Token present but failed verification:",
-          jwtErr.message,
-        );
+        console.warn("Token present but failed verification:", jwtErr.message);
       }
     } else {
-      console.log("ℹ️ No token provided. Processing request as a Guest.");
+      console.log("No token provided. Processing request as a Guest.");
     }
 
     // 2. Fetch the book profile document
