@@ -181,59 +181,6 @@ app.patch(
     }
   },
 );
-// A. USER: Get delivery history logs
-app.get("/deliveries/history", requireAuth, async (req, res) => {
-  try {
-    const userDeliveries = await Delivery.find({ userId: req.user.id }).sort({
-      createdAt: -1,
-    });
-    res.json(userDeliveries);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// B. LIBRARIAN: Fetch all deliveries across system queue lines
-app.get(
-  "/deliveries/manage",
-  requireAuth,
-  requireRole("librarian"),
-  async (req, res) => {
-    try {
-      const queue = await Delivery.find().sort({ createdAt: -1 });
-      res.json(queue);
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  },
-);
-
-// C. LIBRARIAN: Update Fulfillment State Machine (Pending -> Dispatched -> Delivered)
-app.patch(
-  "/deliveries/:id/status",
-  requireAuth,
-  requireRole("librarian"),
-  async (req, res) => {
-    try {
-      const { status } = req.body;
-      if (!["dispatched", "delivered"].includes(status)) {
-        return res
-          .status(400)
-          .json({ message: "Invalid workflow state sequence." });
-      }
-
-      const updatedDelivery = await Delivery.findByIdAndUpdate(
-        req.params.id,
-        { status, updatedAt: new Date() },
-        { new: true },
-      );
-
-      res.json(updatedDelivery);
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  },
-);
 
 app.post("/create-checkout-session", requireAuth, async (req, res) => {
   try {
